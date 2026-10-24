@@ -409,8 +409,10 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 				}
 			}
 			if strings.HasPrefix(f, "@lan") && lanU == nil && envInt("NP_LAN_LISTEN", 1) != 0 {
-				// 局域网模式是【反向】的：访问端 natlan.LanCS 会 getRandPort → 发
-				// `@con|lan|csListen:<port>|!` → csListen 监听，由被控端回连。
+				// 局域网反向连接：访问端 natlan.LanCS(0x6c4c5a00) 用 concatstring5 拼帧
+				//   0x6c4c612d 处 literal 长度 0xa = "@con|lan2|"   ← 注意是 lan2，不是 lan
+				//   然后 + 全局串(0x6c957540) + ":" + 端口 + "|!"（0x6c5e4a3c 长度 2）
+				// 实测 len("src") 见 F:\dsh-temp\lancs2.txt。故默认前缀用 lan2。
 				if lu, port, err := listenUDPEphemeral(); err == nil {
 					lanU = lu
 					u = lu // 后续打洞与 KCP 都走这个 socket
@@ -423,11 +425,26 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 					default:
 						addrStr = net.JoinHostPort(bestLanIP(), strconv.Itoa(port))
 					}
-					msg := fmt.Sprintf("@con|lan|csListen:%s|!", addrStr)
+					lvl := env("NP_LAN_LEVEL", "2")
+					if v := env("NP_LAN_IP", ""); v != "" {
+						addrStr = net.JoinHostPort(v, strconv.Itoa(port))
+					}
+					msg := fmt.Sprintf("@con|lan%s|csListen:%s|!", lvl, addrStr)
 					if err := ct.send(c, msg); err != nil {
 						logf("LAN csListen 上报失败: %v", err)
 					} else {
 						logf("LAN listen 0.0.0.0:%d, SEND %s", port, msg)
+					}
+					// natlan.csListen 绑好后会立刻 UDPConn.WriteToUDP 主动发一包（0x6c4c74a2），
+					// 目的是把「访问端→被控端」这条路先打通，被控端随后才能回连。
+					if envInt("NP_LAN_POKE", 1) != 0 {
+						for _, cand := range parsePeerHints(f, 0) {
+							if ra, err := net.ResolveUDPAddr("udp4", cand); err == nil {
+								if _, err := lanU.WriteToUDP([]byte("cs"), ra); err == nil {
+									logf("LAN poke -> %s", ra)
+								}
+							}
+						}
 					}
 				} else {
 					logf("LAN listen 失败: %v", err)
