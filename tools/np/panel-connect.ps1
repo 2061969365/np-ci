@@ -1,60 +1,81 @@
 # 用本地面板 WS（ws://127.0.0.1:33272/ws，帧分隔 <$!$>）驱动官方客户端：
-#   官方客户端已在启动时按 config 的 Auto_login 自动登录，
-#   这里只发 conpc <pcid>（映射模式连接）并打印所有回帧。
+#   1) login（明文账号密码）
+#   2) 等状态帧 1<...> / 2<...>（y = 顶号确认，自动回 y）
+#   3) pclist 确认 pcid 在线
+#   4) conpc <pcid>（映射模式连接）
 param(
     [Parameter(Mandatory = $true)][string]$Pcid,
+    [Parameter(Mandatory = $true)][string]$User,
+    [Parameter(Mandatory = $true)][string]$Pwd,
     [int]$MaxWaitMs = 25000
 )
 
 $ErrorActionPreference = 'Stop'
 $sep = '<$!$>'
 
-function New-Ws {
-    $ws = [System.Net.WebSockets.ClientWebSocket]::new()
-    $cts = [System.Threading.CancellationTokenSource]::new()
-    $ws.ConnectAsync([Uri]'ws://127.0.0.1:33272/ws', $cts.Token).Wait(15000) | Out-Null
-    return @{ ws = $ws; cts = $cts }
-}
+$ws = [System.Net.WebSockets.ClientWebSocket]::new()
+$cts = [System.Threading.CancellationTokenSource]::new()
+$ws.ConnectAsync([Uri]'ws://127.0.0.1:33272/ws', $cts.Token).Wait(15000) | Out-Null
+Write-Host "WS connected: $($ws.State)"
 
-function Send-Frame($c, [string]$s) {
+function Send-Frame([string]$s) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($s)
     $seg = [ArraySegment[byte]]::new($bytes)
-    $c.ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $c.cts.Token).Wait(8000) | Out-Null
-    Write-Host "WS -> $s"
+    $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).Wait(8000) | Out-Null
+    $shown = $s
+    if ($s -like 'login*' -or $s -like 'y*') { $shown = ($s -split [regex]::Escape($sep))[0] + $sep + '<masked>' }
+    Write-Host "WS -> $shown"
 }
 
-function Recv-Frame($c, [int]$timeoutMs) {
+function Recv-Frame([int]$timeoutMs) {
     $buf = New-Object byte[] 262144
     $seg = [ArraySegment[byte]]::new($buf)
-    $task = $c.ws.ReceiveAsync($seg, $c.cts.Token)
+    $task = $ws.ReceiveAsync($seg, $cts.Token)
     if (-not $task.Wait($timeoutMs)) { return $null }
     if ($task.Result.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { return '<close>' }
     return [Text.Encoding]::UTF8.GetString($buf, 0, $task.Result.Count)
 }
 
-function Drain($c, [int]$ms) {
+function Drain([int]$ms) {
     $deadline = (Get-Date).AddMilliseconds($ms)
     while ((Get-Date) -lt $deadline) {
-        $f = Recv-Frame $c 1500
+        $f = Recv-Frame 1500
         if ($null -eq $f) { continue }
         Write-Host "WS <- $f"
         if ($f -eq '<close>') { return }
     }
 }
 
-$c = New-Ws
-Write-Host "WS connected: $($c.ws.State)"
+# 0) 先读启动状态帧
+Drain 3000 | Out-Null
 
-# 先拉一次主机列表确认登录态
-Send-Frame $c 'pclist'
-Drain $c 5000
+# 1) 登录
+Send-Frame ("login" + $sep + $User + $sep + $Pwd + $sep + "0" + $sep + "0")
+$deadline = (Get-Date).AddSeconds(20)
+$logged = $false
+while ((Get-Date) -lt $deadline -and -not $logged) {
+    $f = Recv-Frame 1500
+    if ($null -eq $f) { continue }
+    Write-Host "WS <- $f"
+    if ($f -like 'y*') {
+        Write-Host '收到 y（顶号确认），回 y'
+        Send-Frame ("y" + $sep + $User + $sep + $Pwd + $sep + "0" + $sep + "0")
+        continue
+    }
+    if ($f -match '^[12]<') { $logged = $true }
+}
+if (-not $logged) { Write-Host '::warning::未检测到登录成功状态帧，仍继续尝试 conpc' }
 
-# 映射模式连接
-Send-Frame $c ("conpc" + $sep + $Pcid)
-Drain $c $MaxWaitMs
+# 2) 主机列表
+Send-Frame 'pclist'
+Drain 5000 | Out-Null
 
-Send-Frame $c 'pclist'
-Drain $c 3000
+# 3) 映射模式连接
+Send-Frame ("conpc" + $sep + $Pcid)
+Drain $MaxWaitMs | Out-Null
 
-$c.ws.Dispose()
+Send-Frame 'pclist'
+Drain 3000 | Out-Null
+
+$ws.Dispose()
 Write-Host 'panel-connect done'

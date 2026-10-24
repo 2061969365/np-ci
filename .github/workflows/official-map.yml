@@ -29,25 +29,6 @@ jobs:
           Expand-Archive tools/np/natpierce-win.zip -DestinationPath np -Force
           Get-ChildItem np -File | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
 
-      - name: 注入凭据（config 明文 JSON，Auto_login）
-        shell: pwsh
-        env:
-          NP_USER: ${{ secrets.NP_USER }}
-          NP_PWD_MD5: ${{ secrets.NP_PWD_MD5 }}
-        run: |
-          if (-not $env:NP_USER -or -not $env:NP_PWD_MD5) { throw '缺少 secrets.NP_USER / NP_PWD_MD5' }
-          $p = 'np/config'
-          $j = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
-          $j.Auto_login = $true
-          $j.Auto_user  = $env:NP_USER
-          $j.Auto_pwd   = $env:NP_PWD_MD5
-          foreach ($u in $j.Users) {
-            $u.Name = $env:NP_USER
-            $u.Con_pwd = $env:NP_PWD_MD5
-          }
-          $j | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
-          Write-Host 'config 已注入（不回显明文）'
-
       - name: 关闭防火墙（避免首次监听弹框）
         shell: pwsh
         run: netsh advfirewall set allprofiles state off
@@ -71,9 +52,14 @@ jobs:
             Where-Object { $_.OwningProcess -eq (Get-Process natpierce).Id } |
             Format-Table -AutoSize | Out-String | Write-Host
 
-      - name: 面板 WS：conpc 连接被控端
+      - name: 面板 WS：login → pclist → conpc
         shell: pwsh
-        run: ./tools/np/panel-connect.ps1 -Pcid '${{ inputs.pcid }}' -MaxWaitMs 25000
+        env:
+          NP_USER: ${{ secrets.NP_USER }}
+          NP_PWD: ${{ secrets.NP_PWD }}
+        run: |
+          if (-not $env:NP_USER -or -not $env:NP_PWD) { throw '缺少 secrets.NP_USER / NP_PWD' }
+          ./tools/np/panel-connect.ps1 -Pcid '${{ inputs.pcid }}' -User $env:NP_USER -Pwd $env:NP_PWD -MaxWaitMs 25000
 
       - name: 探针 PING-MAP / 期待 PONG
         shell: pwsh
