@@ -660,6 +660,14 @@ func kcpDial(u *net.UDPConn, peer *net.UDPAddr) (*kcp.UDPSession, error) {
 	// 清掉打洞阶段残留的 deadline，否则 kcp 的 readLoop 会立刻超时
 	u.SetReadDeadline(time.Time{})
 	u.SetWriteDeadline(time.Time{})
+	// 【重要】KCP 必须复用打洞用过的同一个 socket：NAT 只对这条五元组放行。
+	// 官方 fork 的 DialWithOptions 第 9 参就是 net.PacketConn，同一语义；
+	// 这里用 kcp.NewConn2(peer, block, ds, ps, pc)，pc 就是 u 本身
+	// （MAP_TRACE 时外面只套一层透传的 tapConn，fd 不变）。
+	if d := envInt("NP_KCP_DELAY_MS", 150); d > 0 {
+		logf("KCP 复用打洞 socket %s → %s，等 %dms 让对端 newListen 就绪", u.LocalAddr(), peer, d)
+		time.Sleep(time.Duration(d) * time.Millisecond)
+	}
 
 	key := kcpKey()
 	logf("KCP key = %s", hex.EncodeToString(key))
