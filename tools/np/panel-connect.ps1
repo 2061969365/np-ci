@@ -27,13 +27,20 @@ function Send-Frame([string]$s) {
     Write-Host "WS -> $shown"
 }
 
+# 单条常驻接收任务：避免超时后残留 ReceiveAsync 造成并发接收丢帧
+$script:rxTask = $null
+$script:rxBuf = $null
 function Recv-Frame([int]$timeoutMs) {
-    $buf = New-Object byte[] 262144
-    $seg = [ArraySegment[byte]]::new($buf)
-    $task = $ws.ReceiveAsync($seg, $cts.Token)
-    if (-not $task.Wait($timeoutMs)) { return $null }
-    if ($task.Result.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { return '<close>' }
-    return [Text.Encoding]::UTF8.GetString($buf, 0, $task.Result.Count)
+    if ($null -eq $script:rxTask) {
+        $script:rxBuf = New-Object byte[] 262144
+        $seg = [ArraySegment[byte]]::new($script:rxBuf)
+        $script:rxTask = $ws.ReceiveAsync($seg, $cts.Token)
+    }
+    if (-not $script:rxTask.Wait($timeoutMs)) { return $null }
+    $res = $script:rxTask.Result
+    $script:rxTask = $null
+    if ($res.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { return '<close>' }
+    return [Text.Encoding]::UTF8.GetString($script:rxBuf, 0, $res.Count)
 }
 
 function Drain([int]$ms) {
