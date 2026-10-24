@@ -40,7 +40,7 @@ jobs:
       NP_DURATION: '240'
       MAP_LISTEN: '0.0.0.0:10000'
       MAP_FORWARD: '127.0.0.1:9999'
-      MAP_UDP: '1'
+      MAP_UDP: '0'
       MAP_TRACE: '1'
       MAP_FEC: ${{ inputs.fec || '10,3' }}
       MAP_CRYPT: ${{ inputs.crypt || 'aes' }}
@@ -136,3 +136,4 @@ jobs:
             $pidText = (Get-Content client.pid | Select-Object -First 1).Trim()
             if ($pidText) { Stop-Process -Id ([int]$pidText) -Force -ErrorAction SilentlyContinue }
           }
+
