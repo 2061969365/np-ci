@@ -1,0 +1,138 @@
+name: map-go
+
+# 映射模式（端口映射）最小客户端端到端验证。
+# 目标：被控端 127.0.0.1:9999/UDP（UDP 回声，回 PONG:<payload>）
+#       面板映射规则：本地 9999 / UDP → 远程 10000
+# 本工作流在 runner 上起客户端，再从 runner 本地 127.0.0.1:10000/UDP 发 PING-MAP，
+# 期望穿回被控端并收到 PONG:PING-MAP。
+
+on:
+  workflow_dispatch:
+    inputs:
+      fec:
+        description: 'KCP FEC data,parity'
+        default: '10,3'
+      crypt:
+        description: 'aes | none'
+        default: 'aes'
+  push:
+    paths:
+      - 'tools/mapgo/**'
+      - '.github/workflows/map-go.yml'
+
+concurrency:
+  group: map-go
+  cancel-in-progress: false
+
+jobs:
+  mapgo:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      NP_ACCT: ${{ secrets.NP_ACCT }}
+      NP_PWD: ${{ secrets.NP_PWD }}
+      NP_PCID: ${{ secrets.NP_PCID }}
+      NP_CODE: ${{ secrets.NP_CODE }}
+      NP_CONPWD: ${{ secrets.NP_CONPWD }}
+      NP_PCNAME: CloudMap
+      NP_UDP_PORT: '40100'
+      NP_PUNCH_TIMEOUT: '120'
+      NP_DURATION: '240'
+      MAP_LISTEN: '0.0.0.0:10000'
+      MAP_FORWARD: '127.0.0.1:9999'
+      MAP_UDP: '1'
+      MAP_TRACE: '1'
+      MAP_FEC: ${{ inputs.fec || '10,3' }}
+      MAP_CRYPT: ${{ inputs.crypt || 'aes' }}
+      MAP_LISTEN_FALLBACK: '25'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: tools/mapgo/go.sum
+
+      - name: Build
+        working-directory: tools/mapgo
+        shell: pwsh
+        run: |
+          go version
+          go build -v -o mapgo.exe .
+          Get-Item mapgo.exe | Format-List Name,Length
+
+      - name: Run client
+        working-directory: tools/mapgo
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\mapgo.exe" `
+                 -RedirectStandardOutput client.log `
+                 -RedirectStandardError  client.err `
+                 -NoNewWindow -PassThru
+          $p.Id | Out-File -Encoding ascii client.pid
+          Write-Host "client pid=$($p.Id)"
+
+          $deadline = (Get-Date).AddSeconds(240)
+          $ready = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path client.log) {
+              $c = Get-Content client.log -Raw -ErrorAction SilentlyContinue
+              if ($c -match 'PROXY ready') { $ready = $true; Write-Host 'client ready'; break }
+            }
+            if ($p.HasExited) { Write-Host "client exited code=$($p.ExitCode)"; break }
+            Start-Sleep -Seconds 2
+          }
+          if (Test-Path client.log) { Write-Host '--- client.log (tail) ---'; Get-Content client.log -Tail 80 }
+          if (-not $ready) {
+            Write-Host '::error::客户端未进入 PROXY ready（登录/打洞/KCP 登录失败，见日志）'
+            exit 1
+          }
+
+      - name: UDP probe through mapping :10000 -> :9999
+        working-directory: tools/mapgo
+        shell: pwsh
+        run: |
+          $ok = $false
+          $n = 0
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $deadline -and -not $ok) {
+            $n++
+            $u = New-Object System.Net.Sockets.UdpClient(0)
+            $u.Client.ReceiveTimeout = 2500
+            try {
+              $payload = [Text.Encoding]::ASCII.GetBytes('PING-MAP')
+              $ep = New-Object System.Net.IPEndPoint([Net.IPAddress]::Loopback, 10000)
+              [void]$u.Send($payload, $payload.Length, $ep)
+              $remote = New-Object System.Net.IPEndPoint([Net.IPAddress]::Any, 0)
+              $resp = $u.Receive([ref]$remote)
+              $txt = [Text.Encoding]::ASCII.GetString($resp)
+              Write-Host ("probe #{0}: {1}B hex={2} text={3}" -f $n, $resp.Length, [BitConverter]::ToString($resp), $txt)
+              if ($txt -eq 'PONG:PING-MAP') { $ok = $true }
+            } catch {
+              Write-Host ("probe #{0}: no reply ({1})" -f $n, $_.Exception.Message)
+            } finally {
+              $u.Close()
+            }
+            if (-not $ok) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ok) {
+            Write-Host '::error::UDP 映射未打通（未收到 PONG:PING-MAP）'
+            exit 1
+          }
+          Write-Host '::notice::UDP 映射打通，收到 PONG:PING-MAP'
+
+      - name: Dump logs
+        if: always()
+        working-directory: tools/mapgo
+        shell: pwsh
+        run: |
+          foreach ($f in @('client.log','client.err')) {
+            if (Test-Path $f) {
+              Write-Host "===== $f ====="
+              Get-Content $f -Tail 400
+            }
+          }
+          if (Test-Path client.pid) {
+            $pidText = (Get-Content client.pid | Select-Object -First 1).Trim()
+            if ($pidText) { Stop-Process -Id ([int]$pidText) -Force -ErrorAction SilentlyContinue }
+          }
