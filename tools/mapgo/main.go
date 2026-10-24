@@ -371,9 +371,11 @@ func parseXorMapped(d []byte) (string, int) {
 
 // ---------------------------------------------------------------- 打洞
 
-func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, extPort int, con string) (*net.UDPAddr, error) {
+func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, extPort int, con string) (*net.UDPConn, *net.UDPAddr, error) {
 	buf := make([]byte, 4096)
-	var peer, hint *net.UDPAddr
+	var peer *net.UDPAddr
+	var hints []*net.UDPAddr
+	var lanU *net.UDPConn
 	state := "punch"
 	okCount := 0
 	last2 := time.Time{}
@@ -388,18 +390,55 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 		select {
 		case f, ok := <-frames:
 			if !ok {
-				return nil, errors.New("控制连接已断开")
+				return nil, nil, errors.New("控制连接已断开")
 			}
 			if strings.Contains(f, "@csbusy") {
 				busyUntil = time.Now().Add(15 * time.Second)
 				logf("SERVER BUSY：15s 内不重发 @con（raw=%s）", f)
 				continue
 			}
-			if p := parsePeerHint(f, extPort); p != "" {
-				if ra, err := net.ResolveUDPAddr("udp4", p); err == nil {
-					hint = ra
+			if strings.HasPrefix(f, "@lan") && lanU == nil && envInt("NP_LAN_LISTEN", 1) != 0 {
+				// 局域网模式是【反向】的：访问端 natlan.LanCS 会 getRandPort → 发
+				// `@con|lan|csListen:<port>|!` → csListen 监听，由被控端回连。
+				if lu, port, err := listenUDPEphemeral(); err == nil {
+					lanU = lu
+					u = lu // 后续打洞与 KCP 都走这个 socket
+					addrStr := strconv.Itoa(port)
+					switch env("NP_LAN_FMT", "ip") {
+					case "port":
+						// 原样只带端口
+					case "pub":
+						addrStr = net.JoinHostPort(extIP, strconv.Itoa(port))
+					default:
+						addrStr = net.JoinHostPort(bestLanIP(), strconv.Itoa(port))
+					}
+					msg := fmt.Sprintf("@con|lan|csListen:%s|!", addrStr)
+					if err := ct.send(c, msg); err != nil {
+						logf("LAN csListen 上报失败: %v", err)
+					} else {
+						logf("LAN listen 0.0.0.0:%d, SEND %s", port, msg)
+					}
+				} else {
+					logf("LAN listen 失败: %v", err)
 				}
-				logf("PEER HINT %s", p)
+			}
+			if cands := parsePeerHints(f, extPort); len(cands) > 0 {
+				for _, p := range cands {
+					ra, err := net.ResolveUDPAddr("udp4", p)
+					if err != nil {
+						continue
+					}
+					dup := false
+					for _, h := range hints {
+						if h.String() == ra.String() {
+							dup = true
+						}
+					}
+					if !dup {
+						hints = append(hints, ra)
+					}
+				}
+				logf("PEER HINT %v", cands)
 			}
 		default:
 		}
@@ -413,14 +452,16 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 			nextCon = time.Now().Add(8 * time.Second)
 		}
 
-		// 已知对端候选但 3s 无入包：主动发 '0' 开洞
-		if state == "punch" && hint != nil && time.Since(lastProbe) > 3*time.Second {
-			logf("PROBE '0' x3 -> %s", hint)
-			for i := 0; i < 3; i++ {
-				u.WriteToUDP([]byte("0"), hint)
-				time.Sleep(200 * time.Millisecond)
+		// 已知对端候选但 3s 无入包：主动向所有候选发 '0' 开洞（仅公网模式；LAN 模式由对端回连）
+		if state == "punch" && lanU == nil && len(hints) > 0 && time.Since(lastProbe) > 3*time.Second {
+			logf("PROBE '0' x2 -> %v", hints)
+			for i := 0; i < 2; i++ {
+				for _, h := range hints {
+					u.WriteToUDP([]byte("0"), h)
+				}
+				time.Sleep(150 * time.Millisecond)
 			}
-			peer = hint
+			peer = hints[0]
 			state = "cs0"
 			lastProbe = time.Now()
 		}
@@ -458,8 +499,14 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 			peer = addr
 			if okCount >= 2 {
 				logf("PUNCH done, peer=%s", addr)
-				return addr, nil
+				return u, addr, nil
 			}
+		case state == "punch" && string(p) == "0":
+			// LAN 反向模式：对端回连先发 '0'，我们作为监听方回 '1'
+			u.WriteToUDP([]byte("1"), addr)
+			peer = addr
+			state = "wait2"
+			logf("UDP '0' from %s (对端回连) -> '1'", addr)
 		case state == "punch":
 			peer = addr
 			logf("UDP first pkt from %s -> send '0' x5", addr)
@@ -480,10 +527,55 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 			logf("UDP '2' from %s (body=%q) -> '2'", addr, string(p[1:]))
 		}
 	}
-	return nil, fmt.Errorf("打洞超时（%v）", c.punchTimeout)
+	return nil, nil, fmt.Errorf("打洞超时（%v）", c.punchTimeout)
 }
 
-// isSTUN 识别 STUN Binding Response（0x0101 + magic cookie），避免把迟到的 STUN 回包当成对端首包。
+// bestLanIP 选一个非 link-local / 非回环的 IPv4，供 LAN csListen 上报。
+func bestLanIP() string {
+	for _, ip := range localIPs() {
+		p := net.ParseIP(ip)
+		if p == nil || p.To4() == nil || p.IsLoopback() || p.IsLinkLocalUnicast() {
+			continue
+		}
+		return ip
+	}
+	for _, ip := range localIPs() {
+		if p := net.ParseIP(ip); p != nil && p.To4() != nil && !p.IsLoopback() {
+			return ip
+		}
+	}
+	return "0.0.0.0"
+}
+
+// listenUDPEphemeral 绑定 0.0.0.0:0 并返回实际端口（LAN 反向模式 csListen 用）。
+func listenUDPEphemeral() (*net.UDPConn, int, error) {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, 0, err
+	}
+	return c, c.LocalAddr().(*net.UDPAddr).Port, nil
+}
+
+// rawProbe 用于判定「打洞后的链路是不是裸转发」：直接发明文，看本机 127.0.0.1:9999 的回声是否回来。
+func rawProbe(u *net.UDPConn, peer *net.UDPAddr, forward string) {
+	buf := make([]byte, 2048)
+	for i := 0; i < 3; i++ {
+		msg := fmt.Sprintf("PING-MAP#%d", i+1)
+		u.WriteToUDP([]byte(msg), peer)
+		logf("RAWTEST -> %s %q", peer, msg)
+		deadline := time.Now().Add(1200 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			u.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			n, a, err := u.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			logf("RAWTEST <- %s len=%d hex=%s text=%q", a, n, hexdump(buf[:n]), string(buf[:n]))
+			return
+		}
+	}
+	logf("RAWTEST: 3 次明文探测均无回包（链路不是裸转发，或有 KCP 层）")
+}
 func isSTUN(b []byte) bool {
 	return len(b) >= 20 && b[0] == 0x01 && b[1] == 0x01 && binary.BigEndian.Uint32(b[4:8]) == 0x2112A442
 }
@@ -500,17 +592,40 @@ func drainUDP(u *net.UDPConn, d time.Duration) {
 	}
 }
 
-// parsePeerHint 从 @n11/@lan 帧里抽取对端候选，仅用于日志。
-func parsePeerHint(txt string, extPort int) string {
-	if !strings.HasPrefix(txt, "@n11") && !strings.HasPrefix(txt, "@lan") {
-		return ""
-	}
+// parsePeerHints 从 @n11/@lan 帧里抽取对端候选地址（可多个）。
+//   @n11|1|<ip>|<port>|0|!              → <ip>:<port>
+//   @lan|<ip;ip;...;ip>:<port>|!        → 每个 ip 配同一个 port
+func parsePeerHints(txt string, extPort int) []string {
+	var out []string
 	parts := strings.Split(strings.TrimRight(txt, "|!"), "|")
-	if strings.HasPrefix(txt, "@n11") && len(parts) >= 4 {
-		return parts[2] + ":" + parts[3]
+	switch {
+	case strings.HasPrefix(txt, "@n11"):
+		if len(parts) >= 4 && parts[2] != "" && parts[3] != "" {
+			out = append(out, net.JoinHostPort(parts[2], parts[3]))
+		}
+	case strings.HasPrefix(txt, "@lan"):
+		if len(parts) < 2 || parts[1] == "" {
+			return nil
+		}
+		spec, port := parts[1], ""
+		if i := strings.LastIndex(spec, ":"); i >= 0 {
+			port, spec = spec[i+1:], spec[:i]
+		}
+		if port == "" {
+			port = strconv.Itoa(extPort)
+		}
+		for _, ip := range strings.Split(spec, ";") {
+			if ip = strings.TrimSpace(ip); ip != "" {
+				out = append(out, net.JoinHostPort(ip, port))
+			}
+		}
 	}
-	if strings.HasPrefix(txt, "@lan") && len(parts) >= 2 {
-		return parts[1]
+	return out
+}
+
+func parsePeerHint(txt string, extPort int) string {
+	if h := parsePeerHints(txt, extPort); len(h) > 0 {
+		return h[0]
 	}
 	return ""
 }
@@ -945,11 +1060,45 @@ func (p *proxy) loop() error {
 
 // ---------------------------------------------------------------- main
 
+// runDirect 跳过控制面与打洞，直接对一个已知 UDP 地址建 KCP 并跑 goproxy。
+// 用途：验证 KCP 线格式/加密（例如直连被控端本机 PortForwarding 端口）。
+func runDirect(c cfg, addr string) {
+	ra, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		log.Fatalf("NP_DIRECT 地址非法: %v", err)
+	}
+	u, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		log.Fatalf("UDP bind 失败: %v", err)
+	}
+	logf("DIRECT -> %s（跳过控制面/打洞）", ra)
+	sess, err := kcpDial(u, ra)
+	if err != nil {
+		log.Fatalf("KCP 建链失败: %v", err)
+	}
+	defer sess.Close()
+	if err := kcpLogin(sess); err != nil {
+		log.Fatalf("KCP 登录失败: %v", err)
+	}
+	netw := pickNet(c.mapNet)
+	p := newProxy(sess, c.mapForward, netw)
+	logf("PROXY ready(forward=%s net=%s)，本地监听 %s", c.mapForward, netw, c.mapListen)
+	if err := p.startListener(c.mapListen); err != nil {
+		logf("本地监听失败: %v", err)
+	}
+	select {}
+}
+
 func main() {
 	log.SetFlags(0)
 	c := loadCfg()
 	logf("mapgo start: cs=%s:%d pcid=%s udpPort=%d listen=%s forward=%s net=%q hexWire=%v",
 		csHost, csPort, c.pcid, c.udpPort, c.mapListen, c.mapForward, c.mapNet, c.hexWire)
+
+	if d := env("NP_DIRECT", ""); d != "" {
+		runDirect(c, d)
+		return
+	}
 
 	u, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: c.udpPort})
 	if err != nil {
@@ -1007,9 +1156,13 @@ func main() {
 	}
 	logf("SEND @con: %s", con)
 
-	peer, err := punch(u, ct, frames, c, head, extPort, con)
+	u, peer, err := punch(u, ct, frames, c, head, extPort, con)
 	if err != nil {
 		log.Fatalf("打洞失败: %v", err)
+	}
+
+	if envInt("MAP_RAWTEST", 0) != 0 {
+		rawProbe(u, peer, c.mapForward)
 	}
 
 	sess, err := kcpDial(u, peer)
@@ -1026,6 +1179,42 @@ func main() {
 	p := newProxy(sess, c.mapForward, netw)
 	logf("PROXY ready: forward=%s net=%s（等待 cmd=5，或 %d 秒后用 MAP_LISTEN 兜底）",
 		c.mapForward, netw, envInt("MAP_LISTEN_FALLBACK", 20))
+
+	// 自测：MAP_SELFTEST=1 时自动向本地监听口发 PING-MAP，收到 PONG:PING-MAP 打印 ACCEPT OK
+	if envInt("MAP_SELFTEST", 0) != 0 {
+		go func() {
+			_, portStr, _ := net.SplitHostPort(c.mapListen)
+			port, _ := strconv.Atoi(portStr)
+			dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
+			c, err := net.DialUDP("udp4", nil, dst)
+			if err != nil {
+				logf("SELFTEST dial %s 失败: %v", dst, err)
+				return
+			}
+			defer c.Close()
+			buf := make([]byte, 2048)
+			for i := 1; i <= 6; i++ {
+				time.Sleep(3 * time.Second)
+				msg := fmt.Sprintf("PING-MAP#%d", i)
+				if _, err := c.Write([]byte(msg)); err != nil {
+					logf("SELFTEST 发送失败: %v", err)
+					continue
+				}
+				logf("SELFTEST -> %s %q", dst, msg)
+				c.SetReadDeadline(time.Now().Add(2500 * time.Millisecond))
+				n, err := c.Read(buf)
+				if err != nil {
+					logf("SELFTEST <- 超时")
+					continue
+				}
+				logf("SELFTEST <- %q", string(buf[:n]))
+				if strings.HasPrefix(string(buf[:n]), "PONG:") {
+					logf("ACCEPT OK: PONG 收到，映射链路打通")
+					return
+				}
+			}
+		}()
+	}
 
 	// 兜底：若指定时间没收到 cmd=5，自己起监听（Forward 用 MAP_FORWARD）
 	go func() {
