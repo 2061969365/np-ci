@@ -64,7 +64,25 @@ while ((Get-Date) -lt $deadline -and -not $logged) {
     }
     if ($f -match '^[12]<') { $logged = $true }
 }
-if (-not $logged) { Write-Host '::warning::未检测到登录成功状态帧，仍继续尝试 conpc' }
+if (-not $logged) {
+    Write-Host '::warning::未检测到登录成功状态帧，做诊断后重试一次 login'
+    $pid0 = (Get-Process natpierce -ErrorAction SilentlyContinue).Id
+    Write-Host "--- natpierce pid=$pid0 TCP:"
+    Get-NetTCPConnection -OwningProcess $pid0 -ErrorAction SilentlyContinue |
+        Select-Object State, LocalAddress, LocalPort, RemoteAddress, RemotePort |
+        Format-Table -AutoSize | Out-String | Write-Host
+    Send-Frame 'pcinfo'
+    Drain 3000 | Out-Null
+    Send-Frame ("login" + $sep + $User + $sep + $Pwd + $sep + "0" + $sep + "0")
+    Drain 12000 | Out-Null
+    $pid0 = (Get-Process natpierce -ErrorAction SilentlyContinue).Id
+    Write-Host "--- natpierce pid=$pid0 TCP (retry 后):"
+    Get-NetTCPConnection -OwningProcess $pid0 -ErrorAction SilentlyContinue |
+        Select-Object State, RemoteAddress, RemotePort |
+        Format-Table -AutoSize | Out-String | Write-Host
+    Send-Frame 'pclist'
+    Drain 4000 | Out-Null
+}
 
 # 2) 主机列表
 Send-Frame 'pclist'
