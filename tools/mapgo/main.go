@@ -526,6 +526,13 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 			logf("UDP ok #%d from %s", okCount, addr)
 			peer = addr
 			if okCount >= 2 {
+				// 【§17 假设】被控端在发完 ok×2 后才调 PortForwarding 起 relay；
+				// 若 relay 以"访问端最后一帧"为启动条件，缺这帧就会静默。
+				if envInt("NP_PUNCH_TAIL", 1) != 0 {
+					if _, err := u.WriteToUDP([]byte("2"), addr); err == nil {
+						logf("PUNCH tail '2' -> %s（补发，触发 relay）", addr)
+					}
+				}
 				logf("PUNCH done, peer=%s", addr)
 				return u, addr, nil
 			}
