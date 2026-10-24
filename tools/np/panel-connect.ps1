@@ -91,11 +91,17 @@ if (-not $logged) {
     Drain 4000 | Out-Null
 }
 
-# 2) 主机列表
+# 2) 【§18】先切到映射模式：面板「组网开关」关闭时发的就是这条
+Send-Frame ("VPN" + $sep + "0")
+Start-Sleep -Milliseconds 300
+
+# 3) 查主机状态（面板「刷新」按钮同款），并看 pclist
+Send-Frame ("pcinfo" + $sep + $Pcid)
+Drain 4000 | Out-Null
 Send-Frame 'pclist'
 Drain 5000 | Out-Null
 
-# 3) 映射模式连接
+# 4) 映射模式连接
 Send-Frame ("conpc" + $sep + $Pcid)
 Drain $MaxWaitMs | Out-Null
 
