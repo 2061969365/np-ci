@@ -1,0 +1,104 @@
+name: official-map
+on:
+  workflow_dispatch:
+    inputs:
+      pcid:
+        description: '被控端识别码 (pcid)'
+        default: '685005'
+      local_port:
+        description: '访问端本地监听/映射端口'
+        default: '10000'
+      target_port:
+        description: '被控端 127.0.0.1 端口（面板规则里的本地端口）'
+        default: '9999'
+      wait_s:
+        description: '连接后等待 PONG 的秒数'
+        default: '60'
+
+jobs:
+  official:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解压官方客户端
+        shell: pwsh
+        run: |
+          if (-not (Test-Path tools/np/natpierce-win.zip)) { throw '缺少 tools/np/natpierce-win.zip' }
+          Expand-Archive tools/np/natpierce-win.zip -DestinationPath np -Force
+          Get-ChildItem np -File | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: 注入凭据（config 明文 JSON，Auto_login）
+        shell: pwsh
+        env:
+          NP_USER: ${{ secrets.NP_USER }}
+          NP_PWD_MD5: ${{ secrets.NP_PWD_MD5 }}
+        run: |
+          if (-not $env:NP_USER -or -not $env:NP_PWD_MD5) { throw '缺少 secrets.NP_USER / NP_PWD_MD5' }
+          $p = 'np/config'
+          $j = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+          $j.Auto_login = $true
+          $j.Auto_user  = $env:NP_USER
+          $j.Auto_pwd   = $env:NP_PWD_MD5
+          foreach ($u in $j.Users) {
+            $u.Name = $env:NP_USER
+            $u.Con_pwd = $env:NP_PWD_MD5
+          }
+          $j | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
+          Write-Host 'config 已注入（不回显明文）'
+
+      - name: 关闭防火墙（避免首次监听弹框）
+        shell: pwsh
+        run: netsh advfirewall set allprofiles state off
+
+      - name: 启动官方客户端并等面板
+        shell: pwsh
+        run: |
+          $exe = Get-Item 'np/natpierce.exe'
+          Start-Process -FilePath $exe.FullName -WorkingDirectory $exe.DirectoryName
+          $ok = $false
+          for ($i = 0; $i -lt 90; $i++) {
+            try {
+              $r = Invoke-WebRequest 'http://127.0.0.1:33272/' -TimeoutSec 2 -UseBasicParsing
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) { throw '面板 33272 未就绪' }
+          Write-Host '面板已就绪 http://127.0.0.1:33272'
+          Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
+            Where-Object { $_.OwningProcess -eq (Get-Process natpierce).Id } |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: 面板 WS：conpc 连接被控端
+        shell: pwsh
+        run: ./tools/np/panel-connect.ps1 -Pcid '${{ inputs.pcid }}' -MaxWaitMs 25000
+
+      - name: 探针 PING-MAP / 期待 PONG
+        shell: pwsh
+        run: |
+          $lp = [int]'${{ inputs.local_port }}'
+          $u = New-Object System.Net.Sockets.UdpClient
+          $u.Client.ReceiveTimeout = 3000
+          $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Loopback, $lp)
+          $payload = [Text.Encoding]::ASCII.GetBytes('PING-MAP')
+          $deadline = (Get-Date).AddSeconds([int]'${{ inputs.wait_s }}')
+          $got = $null; $n = 0
+          while ((Get-Date) -lt $deadline -and -not $got) {
+            try { [void]$u.Send($payload, $payload.Length, $ep) } catch { }
+            $n++
+            try {
+              $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+              $buf = $u.Receive([ref]$remote)
+              $txt = [Text.Encoding]::ASCII.GetString($buf)
+              Write-Host "RECV from $remote : $txt"
+              if ($txt -like 'PONG*') { $got = $txt }
+            } catch { }
+            Start-Sleep -Milliseconds 500
+          }
+          $pid0 = (Get-Process natpierce -ErrorAction SilentlyContinue).Id
+          Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -eq $pid0 } |
+            Format-Table -AutoSize | Out-String | Write-Host
+          if ($got) { Write-Host "::notice::ACCEPT OK: $got (tx=$n)" }
+          else { Write-Host "::error::未收到 PONG（发送 $n 次）"; exit 1 }
