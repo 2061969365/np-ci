@@ -397,6 +397,17 @@ func punch(u *net.UDPConn, ct *ctrl, frames <-chan string, c cfg, extIP string, 
 				logf("SERVER BUSY：15s 内不重发 @con（raw=%s）", f)
 				continue
 			}
+			if strings.HasPrefix(f, "@lan") && envInt("NP_LAN_DIRECT", 0) != 0 {
+				// 【实测推论】@lan 的端口就是被控端 server.newListen 的 KCP 监听端口：
+				// 本机 natpierce 收到 @con 后 0.x 秒绑定 0.0.0.0:25839，随后 @lan 就带 25839。
+				// 同 LAN 不需要打洞/不需要 csListen，直接对该地址做 KCP。
+				if cands := parsePeerHints(f, 0); len(cands) > 0 {
+					if ra, err := net.ResolveUDPAddr("udp4", cands[0]); err == nil {
+						logf("LAN DIRECT → %s（跳过打洞/csListen，候选 %d 个）", ra, len(cands))
+						return u, ra, nil
+					}
+				}
+			}
 			if strings.HasPrefix(f, "@lan") && lanU == nil && envInt("NP_LAN_LISTEN", 1) != 0 {
 				// 局域网模式是【反向】的：访问端 natlan.LanCS 会 getRandPort → 发
 				// `@con|lan|csListen:<port>|!` → csListen 监听，由被控端回连。
@@ -628,6 +639,16 @@ func parsePeerHint(txt string, extPort int) string {
 		return h[0]
 	}
 	return ""
+}
+
+// firstHintAddr 把 @lan/@n11 帧的第一个候选解析成 UDPAddr，供打洞后的端口帧使用。
+func firstHintAddr(f string) *net.UDPAddr {
+	for _, s := range parsePeerHints(f, 0) {
+		if a, err := net.ResolveUDPAddr("udp4", s); err == nil {
+			return a
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- KCP
@@ -1167,6 +1188,32 @@ func main() {
 	u, peer, err := punch(u, ct, frames, c, head, extPort, con)
 	if err != nil {
 		log.Fatalf("打洞失败: %v", err)
+	}
+
+	// 打洞完成后，服务端/被控端可能**再补发**一帧端口提示（被控端 newListen 的 KCP 监听端口
+	// 是在它收到 ok 之后才 bind 的，所以必须晚于打洞才知道）。punch() 已经不再读 frames，
+	// 这里接管：记录所有控制帧，并把新的 @lan/@n11 候选交给 KCP。
+	hintCh := make(chan *net.UDPAddr, 8)
+	go func() {
+		for f := range frames {
+			logf("CTRL <- %s", f)
+			if a := firstHintAddr(f); a != nil {
+				select {
+				case hintCh <- a:
+				default:
+				}
+			}
+		}
+	}()
+	if ms := envInt("NP_HINT_WAIT_MS", 3000); ms > 0 {
+		logf("等待打洞后的端口帧（最多 %dms）…", ms)
+		select {
+		case a := <-hintCh:
+			logf("KCP 目标改为 %s（打洞后补发的端口提示）", a)
+			peer = a
+		case <-time.After(time.Duration(ms) * time.Millisecond):
+			logf("无新的端口帧，继续用打洞地址 %s", peer)
+		}
 	}
 
 	if envInt("MAP_RAWTEST", 0) != 0 {
