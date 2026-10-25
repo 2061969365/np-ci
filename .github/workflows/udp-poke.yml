@@ -1,0 +1,25 @@
+name: udp-poke
+on:
+  workflow_dispatch:
+    inputs:
+      ip: {required: true}
+      port: {required: true}
+      count: {required: false, default: "20"}
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          python3 - <<'EOF'
+          import socket, os, time
+          ip=os.environ['IP']; port=int(os.environ['PORT']); n=int(os.environ['CNT'])
+          s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          for i in range(n):
+              s.sendto(('POKE-%d'%i).encode(), (ip, port))
+              time.sleep(0.2)
+          print('sent', n, 'to', ip, port)
+          EOF
+        env:
+          IP: ${{ inputs.ip }}
+          PORT: ${{ inputs.port }}
+          CNT: ${{ inputs.count }}
