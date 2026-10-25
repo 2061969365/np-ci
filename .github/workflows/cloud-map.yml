@@ -1,0 +1,44 @@
+name: cloud-map-interop
+on:
+  workflow_dispatch:
+    inputs:
+      code:
+        description: '被控端 8 位识别码'
+        required: false
+        default: '91505506'
+      pcid:
+        description: '本端 pcid（默认 685006）'
+        required: false
+        default: '685006'
+      udp_port:
+        description: '本端 UDP 端口（需与上报端口一致）'
+        required: false
+        default: '40100'
+      duration:
+        description: '运行秒数'
+        required: false
+        default: '180'
+      sweep:
+        description: '暴力暖入站过滤(1=开)'
+        required: false
+        default: '0'
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pycryptodome
+      - name: run cloud mapping client
+        env:
+          NP_ACCT: ${{ secrets.NP_ACCT }}
+          NP_PWD: ${{ secrets.NP_PWD }}
+          NP_CODE: ${{ inputs.code }}
+          NP_PCID: ${{ inputs.pcid }}
+          NP_UDP_PORT: ${{ inputs.udp_port }}
+          NP_DURATION: ${{ inputs.duration }}
+          NP_SWEEP: ${{ inputs.sweep }}
+        run: python tools/map_client_cloud.py
