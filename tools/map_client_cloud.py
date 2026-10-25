@@ -393,6 +393,7 @@ def main():
 
         try:
             data, addr = u.recvfrom(4096)
+            print('RX from %s:%d len=%d' % (addr[0], addr[1], len(data)), flush=True)
         except socket.timeout:
             continue
         except ConnectionResetError:
