@@ -400,6 +400,15 @@ def main():
             continue
         except ConnectionResetError:
             continue
+        if (not data) and state in ('punch','cs0') and peer is not None:
+            try:
+                u.sendto(b'1', addr)
+                print('HS-1 sent -> %s:%d' % (addr[0], addr[1]), flush=True)
+                state = 'wait2'
+                peer = [addr]
+            except Exception:
+                pass
+            continue
         if data[:2] == b'CS':
             u.sendto(b'CC', addr)
             print('CS from %s:%d -> CC' % (addr[0], addr[1]), flush=True)
