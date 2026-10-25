@@ -130,7 +130,7 @@ punch_i = 0
 punch_end = 0.0
 
 
-def nat11_prepare(u, cands, ext_port):
+def nat11_prepare(u, cands, ext_port, ip=None):
     """准备 nat11 空包齐射参数（非阻塞；收到第一包必须立刻停射）。"""
     global punch_ports, punch_i, punch_end
     bases = set([ext_port])
