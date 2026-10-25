@@ -67,6 +67,8 @@ def resolve_peer(txt):
         if txt.startswith('@n11'):
             ip = parts[2]
             n11_port = int(parts[3])
+            if n11_port > 100000:
+                n11_port -= 100000
             cands = [(ip, EPORT)]
             if n11_port != PORT:
                 cands.append((ip, n11_port))
