@@ -1,0 +1,61 @@
+name: official-access-pcap
+on:
+  workflow_dispatch:
+    inputs:
+      code: {required: false, default: '28698199'}
+      duration: {required: false, default: '120'}
+      target: {required: false, default: 'CloudSrv'}
+jobs:
+  win:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download official client
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://download.natpierce.cn/windows/natpierce-win-v1.06.zip" -OutFile np.zip
+          Expand-Archive np.zip -DestinationPath np -Force
+          Get-ChildItem np -Recurse -Filter natpierce.exe | Select-Object FullName
+
+      - name: start udp capture
+        shell: pwsh
+        run: |
+          pktmon filter remove
+          pktmon filter add -t UDP
+          pktmon start --capture --pkt-size 0 --comp all --file C:\punch.etl
+
+      - name: start client
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem np -Recurse -Filter natpierce.exe | Select-Object -First 1).FullName
+          Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+          Start-Sleep -Seconds 25
+          Test-NetConnection -ComputerName 127.0.0.1 -Port 33272
+
+      - name: drive client
+        env:
+          NP_ACCT: ${{ secrets.NP_ACCT }}
+          NP_PWD: ${{ secrets.NP_PWD }}
+          NP_CODE: ${{ inputs.code }}
+          NP_TARGET: ${{ inputs.target }}
+        run: python tools/ci_official.py
+
+      - name: hold
+        run: Start-Sleep -Seconds 15
+
+      - name: stop capture and convert
+        if: always()
+        shell: pwsh
+        run: |
+          pktmon stop
+          pktmon etl2pcap C:\punch.etl -o C:\punch.pcapng
+          Get-Item C:\punch.pcapng | Select-Object Length
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: punch
+          path: C:\punch.pcapng
+          retention-days: 1
