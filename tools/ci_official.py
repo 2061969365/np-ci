@@ -1,9 +1,9 @@
 import socket, base64, os, struct, time, sys
 
 HOST, PORT = '127.0.0.1', 33272
-ACC = os.environ.get('NP_ACCT', '2061969365@qq.com')
-PWD = os.environ.get('NP_PWD', 'qaz123wsx456')
-CODE = os.environ.get('NP_CODE', '28698199')
+ACC = os.environ.get('NP_ACCT') or '2061969365@qq.com'
+PWD = os.environ.get('NP_PWD') or 'qaz123wsx456'
+CODE = os.environ.get('NP_CODE') or '28698199'
 
 def connect():
     s = socket.create_connection((HOST, PORT), timeout=10)
