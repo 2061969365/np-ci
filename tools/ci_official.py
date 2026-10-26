@@ -1,9 +1,8 @@
-import socket, base64, os, struct, time, sys
+import socket, base64, os, struct, time, sys, re
 
 HOST, PORT = '127.0.0.1', 33272
 ACC = os.environ.get('NP_ACCT') or '2061969365@qq.com'
 PWD = os.environ.get('NP_PWD') or 'qaz123wsx456'
-CODE = os.environ.get('NP_CODE') or '28698199'
 
 def connect():
     s = socket.create_connection((HOST, PORT), timeout=10)
@@ -28,61 +27,58 @@ def send(s, text):
     s.sendall(bytes(h))
 
 buf = b''
-def recv(s, timeout=2):
+def recv(s, timeout=1.5):
     global buf
     s.settimeout(timeout)
     try:
         d = s.recv(65536)
         if not d: return None
         buf += d
-        if len(buf) < 2: return None
-        b0, b1 = buf[0], buf[1]; ln = b1 & 0x7f; off = 2
-        if ln == 126:
-            if len(buf) < 4: return None
-            ln = struct.unpack('!H', buf[2:4])[0]; off = 4
-        if len(buf) < off + ln: return None
-        payload = buf[off:off+ln]; buf = buf[off+ln:]
-        return payload.decode('utf-8', 'replace')
     except (socket.timeout, TimeoutError):
         return None
+    out = []
+    while len(buf) >= 2:
+        b0, b1 = buf[0], buf[1]; ln = b1 & 0x7f; off = 2
+        if ln == 126:
+            if len(buf) < 4: break
+            ln = struct.unpack('!H', buf[2:4])[0]; off = 4
+        if len(buf) < off + ln: break
+        out.append(buf[off:off+ln].decode('utf-8', 'replace')); buf = buf[off+ln:]
+    return out
 
 def main():
-    for attempt in range(20):
+    for _ in range(20):
         try:
             s, _ = connect(); break
         except Exception as e:
             print('wait panel', e, flush=True); time.sleep(3)
     else:
-        sys.exit('panel never came up')
+        sys.exit('panel never up')
     print('panel up', flush=True)
     send(s, 'login<$!$>%s<$!$>%s<$!$>0<$!$>0' % (ACC, PWD))
-    t0 = time.time()
+    time.sleep(6)
+    for m in recv(s, 2) or []: print('LOGIN', m[:120], flush=True)
+
     seq = None
-    while time.time() - t0 < 40:
-        r = recv(s, 2)
-        if not r: continue
-        print('WS <-', r[:150], flush=True)
-        if r.startswith('pclist<$!$>'):
-            parts = r.split('<$!$>')
-            for i in range(2, len(parts) - 1, 5):
-                if parts[i].strip() == 'CloudSrv':
-                    seq = parts[i-1].strip()
-        if seq is None and 'CloudSrv' in r and r.startswith('pclist'):
-            pass
-    # 请求列表后连接
-    send(s, 'pclist')
-    time.sleep(3)
-    while True:
-        r = recv(s, 2)
-        if not r: break
-        print('WS <-', r[:200], flush=True)
+    for i in range(15):
+        send(s, 'pclist')
+        time.sleep(1.2)
+        for m in recv(s, 2) or []:
+            print('LIST', m[:200], flush=True)
+            if m.startswith('pclist<$!$>'):
+                parts = m.split('<$!$>')
+                if len(parts) > 2 and parts[2].strip() == 'CloudSrv':
+                    seq = parts[1].strip()
+        if seq: break
     print('seq', seq, flush=True)
-    if seq:
-        send(s, 'conpc<$!$>%s' % seq)
-        t0 = time.time()
-        while time.time() - t0 < 60:
-            r = recv(s, 2)
-            if r: print('WS <-', r[:200], flush=True)
-    time.sleep(30)
+    if not seq:
+        return
+
+    send(s, 'conpc<$!$>%s' % seq)
+    t0 = time.time()
+    while time.time() - t0 < 100:
+        for m in recv(s, 2) or []:
+            print('CON', m[:200], flush=True)
+    print('done', flush=True)
 
 main()
