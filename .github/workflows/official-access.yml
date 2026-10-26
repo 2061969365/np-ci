@@ -4,6 +4,7 @@ on:
     inputs:
       code: {required: false, default: '28698199'}
       duration: {required: false, default: '120'}
+      target: {required: false, default: 'CloudSrv'}
 jobs:
   win:
     runs-on: windows-latest
@@ -26,6 +27,7 @@ jobs:
           NP_ACCT: ${{ secrets.NP_ACCT }}
           NP_PWD: ${{ secrets.NP_PWD }}
           NP_CODE: ${{ inputs.code }}
+          NP_TARGET: ${{ inputs.target }}
         run: python tools/ci_official.py
       - name: hold
         run: Start-Sleep -Seconds 20
