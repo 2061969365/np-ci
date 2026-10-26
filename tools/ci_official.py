@@ -1,4 +1,8 @@
 import socket, base64, os, struct, time, sys, re
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 HOST, PORT = '127.0.0.1', 33272
 ACC = os.environ.get('NP_ACCT') or '2061969365@qq.com'
