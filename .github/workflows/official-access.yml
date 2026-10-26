@@ -1,0 +1,31 @@
+name: official-access
+on:
+  workflow_dispatch:
+    inputs:
+      code: {required: false, default: '28698199'}
+      duration: {required: false, default: '120'}
+jobs:
+  win:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: download official client
+        run: |
+          Invoke-WebRequest -Uri "https://download.natpierce.cn/windows/natpierce-win-v1.06.zip" -OutFile np.zip
+          Expand-Archive np.zip -DestinationPath np -Force
+          Get-ChildItem np -Recurse -Filter natpierce.exe | Select-Object FullName
+      - name: start client
+        run: |
+          $exe = (Get-ChildItem np -Recurse -Filter natpierce.exe | Select-Object -First 1).FullName
+          Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+          Start-Sleep -Seconds 25
+          Test-NetConnection -ComputerName 127.0.0.1 -Port 33272
+      - name: drive client
+        env:
+          NP_ACCT: ${{ secrets.NP_ACCT }}
+          NP_PWD: ${{ secrets.NP_PWD }}
+          NP_CODE: ${{ inputs.code }}
+        run: python tools/ci_official.py
+      - name: hold
+        run: Start-Sleep -Seconds 20
