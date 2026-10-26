@@ -5,6 +5,7 @@ except Exception:
     pass
 
 HOST, PORT = '127.0.0.1', 33272
+TARGET = os.environ.get('NP_TARGET') or 'CloudSrv'
 ACC = os.environ.get('NP_ACCT') or '2061969365@qq.com'
 PWD = os.environ.get('NP_PWD') or 'qaz123wsx456'
 
@@ -71,7 +72,7 @@ def main():
             print('LIST', m[:200], flush=True)
             if m.startswith('pclist<$!$>'):
                 parts = m.split('<$!$>')
-                if len(parts) > 2 and parts[2].strip() == 'CloudSrv':
+                if len(parts) > 2 and parts[2].strip() == TARGET:
                     seq = parts[1].strip()
         if seq: break
     print('seq', seq, flush=True)
@@ -86,3 +87,4 @@ def main():
     print('done', flush=True)
 
 main()
+
